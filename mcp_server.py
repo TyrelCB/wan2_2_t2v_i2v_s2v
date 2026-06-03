@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -173,4 +174,4 @@ def generate_wan_s2v(
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, middleware=CORS, stateless_http=True)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=int(os.environ.get("MCP_PORT", 8000)), middleware=CORS, stateless_http=True)
