@@ -1,3 +1,4 @@
+import os
 import random
 import time
 from pathlib import Path
@@ -237,4 +238,4 @@ with gr.Blocks(title="Wan 2.2") as demo:
                           outputs=[flf_video, flf_status])
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("GRADIO_SERVER_PORT", 7860)))
