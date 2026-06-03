@@ -36,13 +36,31 @@ export COMFY_URL=http://your-comfyui-host:8188
 | `wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors` | `models/loras/` |
 | `wav2vec2_large_english_fp16.safetensors` | `models/audio_encoder/` |
 
+## Systemd Service
+
+A service file is included for running the Gradio UI on boot. Edit `User`, `WorkingDirectory`, and `GRADIO_SERVER_PORT` to match your setup, then:
+
+```bash
+sudo cp wan2-ui-mcp.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable wan2-ui-mcp
+sudo systemctl start wan2-ui-mcp
+```
+
+Check status and logs:
+
+```bash
+sudo systemctl status wan2-ui-mcp
+sudo journalctl -u wan2-ui-mcp -f
+```
+
 ## Gradio UI
 
 ```bash
 python app.py
 ```
 
-Open `http://localhost:7860`. Four tabs:
+Open `http://localhost:7860` (or the port set by `GRADIO_SERVER_PORT`). Four tabs:
 
 ### Text to Video
 Generate video from a text prompt. Dual-pass LightX2V sampling (4 steps). Default resolution 848×480.
