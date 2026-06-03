@@ -1,0 +1,17 @@
+[Unit]
+Description=Wan 2.2 Video Generation Gradio UI
+After=network.target
+
+[Service]
+Type=simple
+User=tyrel
+WorkingDirectory=/home/tyrel/projects/wan2_2_t2v_i2v_s2v
+ExecStart=/usr/bin/python3 app.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/tyrel/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GRADIO_SERVER_PORT=7862
+
+[Install]
+WantedBy=multi-user.target
