@@ -1,17 +1,18 @@
 [Unit]
-Description=Wan 2.2 Video Generation Gradio UI
+Description=Wan 2.2 Video Generation (Gradio UI + MCP Server)
 After=network.target
 
 [Service]
 Type=simple
 User=tyrel
 WorkingDirectory=/home/tyrel/projects/wan2_2_t2v_i2v_s2v
-ExecStart=/usr/bin/python3 app.py
+ExecStart=/bin/bash start.sh
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/home/tyrel/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=GRADIO_SERVER_PORT=7862
+Environment=MCP_PORT=8001
 
 [Install]
 WantedBy=multi-user.target
