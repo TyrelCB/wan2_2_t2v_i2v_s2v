@@ -51,12 +51,7 @@ def generate_wan_video(
 
 @mcp.tool()
 def generate_wan_flf2v(
-    frame1_path: str,
-    frame2_path: str,
-    frame3_path: str,
-    frame4_path: str,
-    frame5_path: str,
-    frame6_path: str,
+    image_paths: list[str],
     prompt: str = "",
     width: int = 960,
     height: int = 544,
@@ -64,17 +59,14 @@ def generate_wan_flf2v(
     seed: int = -1,
     fps: int = 16,
 ) -> dict:
-    """Generate a video by interpolating between 6 keyframes using Wan 2.2 FLF2V via ComfyUI.
+    """Generate a video by interpolating between keyframes using Wan 2.2 FLF2V via ComfyUI.
 
-    Generates 5 segments between consecutive keyframe pairs and concatenates them.
+    Accepts 2-10 keyframes (in order) and generates one segment between each
+    consecutive pair, concatenating them. N keyframes -> N-1 segments.
 
     Args:
-        frame1_path: Absolute path to keyframe 1 (start).
-        frame2_path: Absolute path to keyframe 2.
-        frame3_path: Absolute path to keyframe 3.
-        frame4_path: Absolute path to keyframe 4.
-        frame5_path: Absolute path to keyframe 5.
-        frame6_path: Absolute path to keyframe 6 (end).
+        image_paths: Ordered list of 2-10 absolute keyframe image paths
+            (first is the start frame, last is the end frame).
         prompt: Optional text prompt applied to all segments.
         width: Frame width in pixels (default 960).
         height: Frame height in pixels (default 544).
@@ -85,10 +77,12 @@ def generate_wan_flf2v(
     Returns:
         dict with 'path' (absolute path to saved video) and 'filename'.
     """
+    n = len(image_paths)
+    if not (2 <= n <= 10):
+        raise ValueError(f"Expected 2-10 keyframe images, got {n}")
     resolved_seed = None if seed < 0 else seed
-    paths = [frame1_path, frame2_path, frame3_path, frame4_path, frame5_path, frame6_path]
-    image_bytes_list = [Path(p).read_bytes() for p in paths]
-    image_filenames = [Path(p).name for p in paths]
+    image_bytes_list = [Path(p).read_bytes() for p in image_paths]
+    image_filenames = [Path(p).name for p in image_paths]
     video_bytes, filename = comfy_client.generate_flf2v(
         image_bytes_list=image_bytes_list, image_filenames=image_filenames,
         prompt=prompt, width=width, height=height,
@@ -144,18 +138,29 @@ def generate_wan_s2v(
     audio_path: str,
     prompt: str = "",
     seed: int = -1,
-    fps: int = 16,
-    chunk_length: int = 43,
+    output_fps: int = 16,
+    width: int = 512,
+    height: int = 512,
+    chunk_length: int = 77,
 ) -> dict:
     """Generate a talking-head video from a reference image and audio using Wan 2.2 14B S2V via ComfyUI.
+
+    The video length is automatically matched to the audio duration (rounded up
+    to a whole chunk, then trimmed to the exact audio length), so the audio is
+    never truncated and there's no silent tail.
 
     Args:
         image_path: Absolute path to the reference face image.
         audio_path: Absolute path to the audio file (WAV recommended).
         prompt: Optional text prompt (default empty).
         seed: Random seed; -1 for a random seed.
-        fps: Output video frames per second (default 16).
-        chunk_length: Frames per generation chunk (default 43). Lower = less VRAM.
+        output_fps: Output video frames per second (default 16). S2V always
+            generates at 16fps; higher values are produced by motion-compensated
+            frame interpolation (duration and lip-sync preserved).
+        width: Output frame width in pixels (default 512, multiple of 16).
+        height: Output frame height in pixels (default 512, multiple of 16).
+        chunk_length: Frames per generation chunk (default 77). Lower = less VRAM.
+            The number of chunks is derived from the audio length automatically.
 
     Returns:
         dict with 'path' (absolute path to saved video) and 'filename'.
@@ -166,7 +171,8 @@ def generate_wan_s2v(
     video_bytes, filename = comfy_client.generate_s2v(
         image_bytes=image_bytes, image_filename=Path(image_path).name,
         audio_bytes=audio_bytes, audio_filename=Path(audio_path).name,
-        prompt=prompt, seed=resolved_seed, fps=fps, chunk_length=chunk_length,
+        prompt=prompt, seed=resolved_seed, output_fps=output_fps,
+        width=width, height=height, chunk_length=chunk_length,
     )
     out_path = OUTPUT_DIR / filename
     out_path.write_bytes(video_bytes)

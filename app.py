@@ -83,7 +83,7 @@ def generate_i2v(image_path, prompt, width, height, length, seed, fps, progress=
 
 # ── S2V (Talking Head) ────────────────────────────────────────────────────────
 
-def generate_s2v(image_path, audio_path, prompt, seed, fps, chunk_length, progress=gr.Progress()):
+def generate_s2v(image_path, audio_path, prompt, seed, output_fps, width, height, chunk_length, progress=gr.Progress()):
     if image_path is None:
         yield gr.update(), gr.update(value="Error: reference image is required")
         return
@@ -91,38 +91,53 @@ def generate_s2v(image_path, audio_path, prompt, seed, fps, chunk_length, progre
         yield gr.update(), gr.update(value="Error: audio file is required")
         return
     resolved_seed = random.randint(0, 2**32 - 1) if seed < 0 else int(seed)
+    gen_fps = comfy_client.S2V_GEN_FPS
+    output_fps = int(output_fps)
     yield gr.update(value=None), gr.update(value=f"Uploading files… seed: {resolved_seed}")
     try:
+        duration = comfy_client.audio_duration_seconds(audio_path)
+        num_chunks, trim_frames = comfy_client.plan_s2v(duration, gen_fps, int(chunk_length))
         image_bytes = Path(image_path).read_bytes()
         audio_bytes = Path(audio_path).read_bytes()
         stored_image = comfy_client.upload_image(image_bytes, Path(image_path).name)
         stored_audio = comfy_client.upload_audio(audio_bytes, Path(audio_path).name)
         wf = comfy_client.build_s2v_workflow(
             image_filename=stored_image, audio_filename=stored_audio,
-            prompt=prompt, seed=resolved_seed, fps=int(fps), chunk_length=int(chunk_length),
+            prompt=prompt, seed=resolved_seed, fps=gen_fps, chunk_length=int(chunk_length),
+            num_chunks=num_chunks, trim_frames=trim_frames,
+            width=int(width), height=int(height),
         )
         prompt_id = comfy_client.submit(wf)
         t_start = time.time()
-        yield gr.update(value=None), gr.update(value=f"Queued — seed: {resolved_seed}  |  id: {prompt_id}")
+        yield gr.update(value=None), gr.update(value=(
+            f"Queued — audio {duration:.1f}s → {num_chunks} chunk(s)  |  "
+            f"seed: {resolved_seed}  |  id: {prompt_id}"))
         data = comfy_client.poll(prompt_id, timeout=900.0, on_progress=_progress_fn(progress, resolved_seed))
-        yield gr.update(value=None), gr.update(value="Downloading…")
         video_info = data["outputs"]["113"]["images"][0]
         video_bytes = comfy_client.download_video(video_info)
+        if output_fps != gen_fps:
+            yield gr.update(value=None), gr.update(value=f"Interpolating {gen_fps}→{output_fps}fps…")
+            video_bytes = comfy_client.interpolate_fps(video_bytes, gen_fps, output_fps)
+        else:
+            yield gr.update(value=None), gr.update(value="Downloading…")
         path, status = _save_and_return(video_bytes, video_info["filename"], t_start, resolved_seed)
         yield gr.update(value=path), gr.update(value=status)
     except Exception as e:
         yield gr.update(value=None), gr.update(value=f"Error: {e}")
 
 
-# ── FLF2V (6-keyframe) ────────────────────────────────────────────────────────
+# ── FLF2V (variable keyframes, 2-10) ──────────────────────────────────────────
 
-def generate_flf2v(kf1, kf2, kf3, kf4, kf5, kf6, prompt, width, height, frames, seed, fps, progress=gr.Progress()):
-    paths = [kf1, kf2, kf3, kf4, kf5, kf6]
-    if any(p is None for p in paths):
-        yield gr.update(), gr.update(value="Error: all 6 keyframe images are required")
+def generate_flf2v(*args, progress=gr.Progress()):
+    # Leading args are the 10 keyframe slots; trailing are the other controls.
+    *kf_slots, prompt, width, height, frames, seed, fps = args
+    paths = [p for p in kf_slots if p is not None]  # filled slots, in order
+    n = len(paths)
+    if n < 2:
+        yield gr.update(), gr.update(value="Error: provide at least 2 keyframe images")
         return
     resolved_seed = random.randint(0, 2**32 - 1) if seed < 0 else int(seed)
-    yield gr.update(value=None), gr.update(value=f"Uploading 6 keyframes… seed: {resolved_seed}")
+    yield gr.update(value=None), gr.update(value=f"Uploading {n} keyframes… seed: {resolved_seed}")
     try:
         image_bytes_list = [Path(p).read_bytes() for p in paths]
         image_filenames = [Path(p).name for p in paths]
@@ -197,29 +212,35 @@ with gr.Blocks(title="Wan 2.2") as demo:
                     s2v_audio = gr.Audio(label="Audio", type="filepath")
                     s2v_prompt = gr.Textbox(label="Prompt (optional)", lines=2)
                     with gr.Row():
+                        s2v_width = gr.Slider(label="Width", minimum=256, maximum=1280, step=16, value=512)
+                        s2v_height = gr.Slider(label="Height", minimum=256, maximum=1280, step=16, value=512)
+                    with gr.Row():
                         s2v_seed = gr.Number(label="Seed (-1 = random)", value=-1, precision=0)
-                        s2v_fps = gr.Number(label="FPS", value=16, precision=0)
-                    s2v_chunk = gr.Number(label="Chunk Length (frames/chunk)", value=43, precision=0)
+                        s2v_fps = gr.Number(label="Output FPS (16 native; higher = interpolated)", value=16, precision=0)
+                    s2v_chunk = gr.Number(label="Chunk Length (frames/chunk — chunk count auto-set to audio length)", value=77, precision=0)
                     s2v_btn = gr.Button("Generate", variant="primary")
                 with gr.Column(scale=3):
                     s2v_video = gr.Video(label="Output Video")
                     s2v_status = gr.Textbox(label="Status", interactive=False, lines=2)
             s2v_btn.click(fn=generate_s2v,
-                          inputs=[s2v_image, s2v_audio, s2v_prompt, s2v_seed, s2v_fps, s2v_chunk],
+                          inputs=[s2v_image, s2v_audio, s2v_prompt, s2v_seed, s2v_fps, s2v_width, s2v_height, s2v_chunk],
                           outputs=[s2v_video, s2v_status])
 
         with gr.Tab("First/Last Frame"):
             with gr.Row():
                 with gr.Column(scale=2):
-                    gr.Markdown("Upload 6 keyframes in order. Each consecutive pair generates one segment.")
-                    with gr.Row():
-                        flf_kf1 = gr.Image(label="Frame 1 (start)", type="filepath")
-                        flf_kf2 = gr.Image(label="Frame 2", type="filepath")
-                        flf_kf3 = gr.Image(label="Frame 3", type="filepath")
-                    with gr.Row():
-                        flf_kf4 = gr.Image(label="Frame 4", type="filepath")
-                        flf_kf5 = gr.Image(label="Frame 5", type="filepath")
-                        flf_kf6 = gr.Image(label="Frame 6 (end)", type="filepath")
+                    gr.Markdown("Upload 2–10 keyframes in order. Each consecutive pair generates one segment; empty slots are skipped.")
+                    flf_kfs = []
+                    for row_start in range(0, 10, 5):
+                        with gr.Row():
+                            for idx in range(row_start, row_start + 5):
+                                if idx == 0:
+                                    lbl = "Frame 1 (start)"
+                                elif idx == 9:
+                                    lbl = "Frame 10 (end)"
+                                else:
+                                    lbl = f"Frame {idx + 1}"
+                                flf_kfs.append(gr.Image(label=lbl, type="filepath"))
                     flf_prompt = gr.Textbox(label="Prompt (optional)", lines=2)
                     with gr.Row():
                         flf_width = gr.Number(label="Width", value=960, precision=0)
@@ -233,9 +254,9 @@ with gr.Blocks(title="Wan 2.2") as demo:
                     flf_video = gr.Video(label="Output Video")
                     flf_status = gr.Textbox(label="Status", interactive=False, lines=2)
             flf_btn.click(fn=generate_flf2v,
-                          inputs=[flf_kf1, flf_kf2, flf_kf3, flf_kf4, flf_kf5, flf_kf6,
+                          inputs=[*flf_kfs,
                                   flf_prompt, flf_width, flf_height, flf_frames, flf_seed, flf_fps],
                           outputs=[flf_video, flf_status])
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("GRADIO_SERVER_PORT", 7860)))
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("GRADIO_SERVER_PORT", 7860)), pwa=True)

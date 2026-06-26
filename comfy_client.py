@@ -1,11 +1,17 @@
 import copy
+import math
 import os
 import random
+import subprocess
 import time
 
 import requests
 
 COMFY_URL = os.environ.get("COMFY_URL", "http://192.168.6.181:8188").rstrip("/")
+
+# Wan 2.2 S2V aligns audio to frames on a hardcoded 16fps timeline, so the model
+# always generates at this rate. Higher output fps is produced by interpolation.
+S2V_GEN_FPS = 16
 
 _NEG = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
@@ -86,21 +92,17 @@ S2V_BASE_WORKFLOW = {
     "80":  {"inputs": {"samples": ["95", 0], "vae": ["39", 0]}, "class_type": "VAEDecode"},
     "82":  {"inputs": {"fps": 16, "images": ["96", 0], "audio": ["58", 0]}, "class_type": "CreateVideo"},
     "93":  {"inputs": {"width": 512, "height": 512, "length": ["104", 0], "batch_size": 1, "positive": ["6", 0], "negative": ["7", 0], "vae": ["39", 0], "audio_encoder_output": ["56", 0], "ref_image": ["52", 0]}, "class_type": "WanSoundImageToVideo"},
-    "94":  {"inputs": {"dim": "t", "index": 0, "amount": 1, "samples": ["85:182", 0]}, "class_type": "LatentCut"},
-    "95":  {"inputs": {"dim": "t", "samples1": ["94", 0], "samples2": ["85:182", 0]}, "class_type": "LatentConcat"},
+    "94":  {"inputs": {"dim": "t", "index": 0, "amount": 1, "samples": ["3", 0]}, "class_type": "LatentCut"},
+    "95":  {"inputs": {"dim": "t", "samples1": ["94", 0], "samples2": ["3", 0]}, "class_type": "LatentConcat"},
     "96":  {"inputs": {"batch_index": ["100", 0], "length": 4096, "image": ["80", 0]}, "class_type": "ImageFromBatch"},
     "100": {"inputs": {"value": 3}, "class_type": "PrimitiveInt"},
     "103": {"inputs": {"value": 4}, "class_type": "PrimitiveInt"},
-    "104": {"inputs": {"value": 43}, "class_type": "PrimitiveInt"},
+    "104": {"inputs": {"value": 77}, "class_type": "PrimitiveInt"},
     "105": {"inputs": {"value": 1}, "class_type": "PrimitiveFloat"},
     "107": {"inputs": {"lora_name": "wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors", "strength_model": 1, "model": ["37", 0]}, "class_type": "LoraLoaderModelOnly"},
     "113": {"inputs": {"filename_prefix": "video/ComfyUI", "format": "auto", "codec": "auto", "video-preview": "", "video": ["82", 0]}, "class_type": "SaveVideo"},
-    "79:76": {"inputs": {"length": ["104", 0], "positive": ["6", 0], "negative": ["7", 0], "vae": ["39", 0], "video_latent": ["3", 0], "audio_encoder_output": ["56", 0], "ref_image": ["52", 0]}, "class_type": "WanSoundImageToVideoExtend"},
-    "79:77": {"inputs": {"seed": 1, "steps": ["103", 0], "cfg": ["105", 0], "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1, "model": ["54", 0], "positive": ["79:76", 0], "negative": ["79:76", 1], "latent_image": ["79:76", 2]}, "class_type": "KSampler"},
-    "79:78": {"inputs": {"dim": "t", "samples1": ["3", 0], "samples2": ["79:77", 0]}, "class_type": "LatentConcat"},
-    "85:182": {"inputs": {"dim": "t", "samples1": ["79:78", 0], "samples2": ["85:183", 0]}, "class_type": "LatentConcat"},
-    "85:183": {"inputs": {"seed": 250, "steps": ["103", 0], "cfg": ["105", 0], "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1, "model": ["54", 0], "positive": ["85:184", 0], "negative": ["85:184", 1], "latent_image": ["85:184", 2]}, "class_type": "KSampler"},
-    "85:184": {"inputs": {"length": ["104", 0], "positive": ["6", 0], "negative": ["7", 0], "vae": ["39", 0], "video_latent": ["79:78", 0], "audio_encoder_output": ["56", 0], "ref_image": ["52", 0]}, "class_type": "WanSoundImageToVideoExtend"},
+    # Extend chunks (WanSoundImageToVideoExtend + KSampler + LatentConcat) are
+    # generated dynamically in build_s2v_workflow() based on the audio duration.
 }
 
 # ── Upload helpers ────────────────────────────────────────────────────────────
@@ -167,21 +169,134 @@ def build_i2v_workflow(
     return wf
 
 
+def audio_duration_seconds(path: str) -> float:
+    """Return the duration of an audio file in seconds.
+
+    Uses soundfile's header read (fast, no full decode) and falls back to
+    ffprobe for formats soundfile can't open (e.g. mp3 on some builds).
+    """
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        if info.samplerate:
+            return info.frames / info.samplerate
+    except Exception:
+        pass
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    return float(out.stdout.strip())
+
+
+def interpolate_fps(video_bytes: bytes, src_fps: int, target_fps: int) -> bytes:
+    """Motion-interpolate a video to target_fps, preserving duration and audio.
+
+    Returns the input unchanged when target_fps == src_fps. Uses ffmpeg's
+    minterpolate (motion-compensated) so lip-sync stays aligned to the audio.
+    """
+    if int(target_fps) == int(src_fps):
+        return video_bytes
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        dst = os.path.join(d, "out.mp4")
+        with open(src, "wb") as f:
+            f.write(video_bytes)
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+             "-vf", f"minterpolate=fps={int(target_fps)}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1",
+             "-c:a", "copy", dst],
+            check=True,
+        )
+        with open(dst, "rb") as f:
+            return f.read()
+
+
+def s2v_frames_per_chunk(chunk_length: int) -> int:
+    """Real decoded frames produced per chunk.
+
+    The node floors length to a latent count: latent_t = ((length-1)//4)+1,
+    and emits latent_t*4 frames. So 41..44 all yield 44 frames, etc.
+    """
+    latent_t = ((chunk_length - 1) // 4) + 1
+    return latent_t * 4
+
+
+def plan_s2v(duration_seconds: float, fps: int, chunk_length: int) -> tuple[int, int]:
+    """Plan chunk count and trim length for a given audio duration.
+
+    Returns (num_chunks, trim_frames). num_chunks is rounded up so the
+    generated video is at least as long as the audio (never truncated);
+    trim_frames is the exact audio length in frames so the output can be
+    trimmed to the audio, discarding any over-generated tail.
+    """
+    target = math.ceil(duration_seconds * fps)
+    fpc = s2v_frames_per_chunk(chunk_length)
+    # Generated frames = num_chunks*fpc - 2 (see build_s2v_workflow); ensure >= target.
+    num_chunks = max(1, math.ceil((target + 2) / fpc))
+    return num_chunks, target
+
+
+def chunks_for_audio(duration_seconds: float, fps: int, chunk_length: int) -> int:
+    """Backward-compatible shim: chunk count only (see plan_s2v)."""
+    return plan_s2v(duration_seconds, fps, chunk_length)[0]
+
+
 def build_s2v_workflow(
     image_filename: str,
     audio_filename: str,
     prompt: str = "",
     seed: int | None = None,
     fps: int = 16,
-    chunk_length: int = 43,
+    chunk_length: int = 77,
+    num_chunks: int = 3,
+    trim_frames: int | None = None,
+    width: int = 512,
+    height: int = 512,
 ) -> dict:
     wf = copy.deepcopy(S2V_BASE_WORKFLOW)
     wf["52"]["inputs"]["image"] = image_filename
     wf["58"]["inputs"]["audio"] = audio_filename
     wf["6"]["inputs"]["text"] = prompt
-    wf["3"]["inputs"]["seed"] = seed if seed is not None else random.randint(0, 2**32 - 1)
+    base_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
+    wf["3"]["inputs"]["seed"] = base_seed
     wf["104"]["inputs"]["value"] = chunk_length
     wf["82"]["inputs"]["fps"] = fps
+    # Resolution is set on the initial chunk (node 93); Extend nodes inherit it
+    # from the previous chunk's latent shape.
+    wf["93"]["inputs"]["width"] = width
+    wf["93"]["inputs"]["height"] = height
+    # Trim the decoded frames to the exact audio length (drop over-generated tail).
+    if trim_frames is not None:
+        wf["96"]["inputs"]["length"] = int(trim_frames)
+
+    # Build the extend chain: chunk 1 is node "3"; each extra chunk adds an
+    # Extend node + KSampler, accumulating latents via LatentConcat.
+    num_chunks = max(1, int(num_chunks))
+    prev_accum = "3"
+    for i in range(2, num_chunks + 1):
+        ext, ks, cat = f"ext{i}", f"ks{i}", f"cat{i}"
+        wf[ext] = {"inputs": {
+            "length": ["104", 0], "positive": ["6", 0], "negative": ["7", 0],
+            "vae": ["39", 0], "video_latent": [prev_accum, 0],
+            "audio_encoder_output": ["56", 0], "ref_image": ["52", 0],
+        }, "class_type": "WanSoundImageToVideoExtend"}
+        wf[ks] = {"inputs": {
+            "seed": (base_seed + i) % (2**32), "steps": ["103", 0], "cfg": ["105", 0],
+            "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1,
+            "model": ["54", 0], "positive": [ext, 0], "negative": [ext, 1],
+            "latent_image": [ext, 2],
+        }, "class_type": "KSampler"}
+        wf[cat] = {"inputs": {
+            "dim": "t", "samples1": [prev_accum, 0], "samples2": [ks, 0],
+        }, "class_type": "LatentConcat"}
+        prev_accum = cat
+
+    # Point the final trim/concat at the fully accumulated latent.
+    wf["94"]["inputs"]["samples"] = [prev_accum, 0]
+    wf["95"]["inputs"]["samples2"] = [prev_accum, 0]
     return wf
 
 # ── FLF2V (6-keyframe) ────────────────────────────────────────────────────────
@@ -211,35 +326,12 @@ def _flf_segment(prefix: str, start_ref: str, end_ref: str, neg_ref: str, decode
         decode_out:        {"inputs": {"samples": [f"{prefix}:klo", 0], "vae": [f"{prefix}:vae", 0]}, "class_type": "VAEDecode"},
     }
 
-# Segment decode output node IDs (referenced by the ImageBatch concat chain)
-_SEG_DECODE = ["s1:dec", "s2:dec", "s3:dec", "s4:dec", "s5:dec"]
-_SEG_PREFIXES = ["s1", "s2", "s3", "s4", "s5"]
-# Keyframe image node IDs
-_KF_NODES = ["kf1", "kf2", "kf3", "kf4", "kf5", "kf6"]
-
-def _build_flf2v_base() -> dict:
-    wf: dict = {}
-    # Keyframe LoadImage nodes
-    for node_id in _KF_NODES:
-        wf[node_id] = {"inputs": {"image": ""}, "class_type": "LoadImage"}
-    # 5 segments: consecutive keyframe pairs
-    pairs = list(zip(_KF_NODES, _KF_NODES[1:]))
-    for prefix, decode_out, (start_ref, end_ref) in zip(_SEG_PREFIXES, _SEG_DECODE, pairs):
-        wf.update(_flf_segment(prefix, start_ref, end_ref, f"{prefix}:neg", decode_out))
-    # Concat chain: batch all decoded frame tensors
-    wf["batch1"] = {"inputs": {"image1": [_SEG_DECODE[0], 0], "image2": [_SEG_DECODE[1], 0]}, "class_type": "ImageBatch"}
-    wf["batch2"] = {"inputs": {"image1": ["batch1", 0], "image2": [_SEG_DECODE[2], 0]}, "class_type": "ImageBatch"}
-    wf["batch3"] = {"inputs": {"image1": ["batch2", 0], "image2": [_SEG_DECODE[3], 0]}, "class_type": "ImageBatch"}
-    wf["batch4"] = {"inputs": {"image1": ["batch3", 0], "image2": [_SEG_DECODE[4], 0]}, "class_type": "ImageBatch"}
-    wf["cv"]     = {"inputs": {"fps": 16, "images": ["batch4", 0]}, "class_type": "CreateVideo"}
-    wf["save"]   = {"inputs": {"filename_prefix": "video/flf2v", "format": "auto", "codec": "auto", "video-preview": "", "video": ["cv", 0]}, "class_type": "SaveVideo"}
-    return wf
-
-FLF2V_BASE_WORKFLOW = _build_flf2v_base()
+FLF2V_MIN_KEYFRAMES = 2
+FLF2V_MAX_KEYFRAMES = 10
 
 
 def build_flf2v_workflow(
-    image_filenames: list[str],  # exactly 6
+    image_filenames: list[str],  # 2..10 keyframes
     prompt: str = "",
     width: int = 960,
     height: int = 544,
@@ -247,19 +339,42 @@ def build_flf2v_workflow(
     seed: int | None = None,
     fps: int = 16,
 ) -> dict:
-    if len(image_filenames) != 6:
-        raise ValueError(f"Expected 6 keyframe images, got {len(image_filenames)}")
+    n = len(image_filenames)
+    if not (FLF2V_MIN_KEYFRAMES <= n <= FLF2V_MAX_KEYFRAMES):
+        raise ValueError(
+            f"Expected {FLF2V_MIN_KEYFRAMES}-{FLF2V_MAX_KEYFRAMES} keyframe images, got {n}")
     base_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
-    wf = copy.deepcopy(FLF2V_BASE_WORKFLOW)
-    for node_id, filename in zip(_KF_NODES, image_filenames):
-        wf[node_id]["inputs"]["image"] = filename
-    for i, prefix in enumerate(_SEG_PREFIXES):
+
+    wf: dict = {}
+    # N keyframe LoadImage nodes.
+    kf_nodes = [f"kf{i}" for i in range(1, n + 1)]
+    for node_id, filename in zip(kf_nodes, image_filenames):
+        wf[node_id] = {"inputs": {"image": filename}, "class_type": "LoadImage"}
+
+    # N-1 segments between consecutive keyframe pairs.
+    seg_prefixes = [f"s{i}" for i in range(1, n)]
+    seg_decode = [f"{p}:dec" for p in seg_prefixes]
+    pairs = list(zip(kf_nodes, kf_nodes[1:]))
+    for i, (prefix, decode_out, (start_ref, end_ref)) in enumerate(zip(seg_prefixes, seg_decode, pairs)):
+        wf.update(_flf_segment(prefix, start_ref, end_ref, f"{prefix}:neg", decode_out))
         wf[f"{prefix}:pos"]["inputs"]["text"] = prompt
         wf[f"{prefix}:flf"]["inputs"]["width"] = width
         wf[f"{prefix}:flf"]["inputs"]["height"] = height
         wf[f"{prefix}:flf"]["inputs"]["length"] = frames_per_segment
         wf[f"{prefix}:khi"]["inputs"]["noise_seed"] = (base_seed + i) % (2**32)
-    wf["cv"]["inputs"]["fps"] = fps
+
+    # Concat decoded segments into one image batch (N-2 ImageBatch nodes).
+    # With a single segment there's nothing to batch; feed it straight to video.
+    final_images = [seg_decode[0], 0]
+    prev = seg_decode[0]
+    for j in range(1, len(seg_decode)):
+        bn = f"batch{j}"
+        wf[bn] = {"inputs": {"image1": [prev, 0], "image2": [seg_decode[j], 0]}, "class_type": "ImageBatch"}
+        prev = bn
+        final_images = [bn, 0]
+
+    wf["cv"] = {"inputs": {"fps": fps, "images": final_images}, "class_type": "CreateVideo"}
+    wf["save"] = {"inputs": {"filename_prefix": "video/flf2v", "format": "auto", "codec": "auto", "video-preview": "", "video": ["cv", 0]}, "class_type": "SaveVideo"}
     return wf
 
 # ── Core API ──────────────────────────────────────────────────────────────────
@@ -352,17 +467,35 @@ def generate_s2v(
     audio_filename: str,
     prompt: str = "",
     seed: int | None = None,
-    fps: int = 16,
-    chunk_length: int = 43,
+    output_fps: int = 16,
+    chunk_length: int = 77,
+    width: int = 512,
+    height: int = 512,
+    num_chunks: int | None = None,
     on_progress=None,
 ) -> tuple[bytes, str]:
+    # S2V always generates at the native 16fps; output_fps>16 is interpolated.
+    trim_frames = None
+    if num_chunks is None:
+        # Match the video length to the audio: enough chunks to cover it, then
+        # trim the exact audio length so there's no over-generated silent tail.
+        import tempfile
+        suffix = os.path.splitext(audio_filename)[1] or ".wav"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+            tmp.write(audio_bytes)
+            tmp.flush()
+            duration = audio_duration_seconds(tmp.name)
+        num_chunks, trim_frames = plan_s2v(duration, S2V_GEN_FPS, chunk_length)
     stored_image = upload_image(image_bytes, image_filename)
     stored_audio = upload_audio(audio_bytes, audio_filename)
-    wf = build_s2v_workflow(stored_image, stored_audio, prompt, seed, fps, chunk_length)
+    wf = build_s2v_workflow(stored_image, stored_audio, prompt, seed, S2V_GEN_FPS, chunk_length,
+                            num_chunks, trim_frames, width=width, height=height)
     prompt_id = submit(wf)
     data = poll(prompt_id, on_progress=on_progress)
     video_info = data["outputs"]["113"]["images"][0]
-    return download_video(video_info), video_info["filename"]
+    video_bytes = download_video(video_info)
+    video_bytes = interpolate_fps(video_bytes, S2V_GEN_FPS, output_fps)
+    return video_bytes, video_info["filename"]
 
 
 def generate_flf2v(
